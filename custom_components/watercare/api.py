@@ -218,11 +218,17 @@ class WatercareApi:
         ]:
             raise ValueError("Invalid endpoint specified")
 
-        if endpoint == "halfhourly":
-            # default to last 7 days if not specified
+        # These endpoints require from/to query params (otherwise the API
+        # returns 400). Default to a sensible window per endpoint when the
+        # caller doesn't specify one.
+        default_windows = {
+            "halfhourly": timedelta(days=7),
+            "monthly": timedelta(days=730),
+        }
+        if endpoint in default_windows:
             if start_date is None:
                 end_date = datetime.now()
-                start_date = end_date - timedelta(days=7)
+                start_date = end_date - default_windows[endpoint]
             elif end_date is None:
                 end_date = datetime.now()
 
