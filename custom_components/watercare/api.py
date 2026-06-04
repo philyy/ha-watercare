@@ -223,6 +223,7 @@ class WatercareApi:
         # caller doesn't specify one.
         default_windows = {
             "halfhourly": timedelta(days=7),
+            "dailywithstats": timedelta(days=365),
             "monthly": timedelta(days=730),
         }
         if endpoint in default_windows:
