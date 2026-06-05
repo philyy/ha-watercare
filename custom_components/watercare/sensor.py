@@ -347,7 +347,7 @@ class WatercareUsageSensor(SensorEntity):
                 statistic_id=f"{DOMAIN}:water_consumption",
                 unit_of_measurement=self._unit_of_measurement,
                 mean_type=StatisticMeanType.NONE,
-                unit_class=None,
+                unit_class="volume",
             )
 
             _LOGGER.debug(
@@ -525,7 +525,7 @@ class WatercareUsageSensor(SensorEntity):
                 statistic_id=f"{DOMAIN}:halfhourly_consumption",
                 unit_of_measurement=self._unit_of_measurement,
                 mean_type=StatisticMeanType.NONE,
-                unit_class=None,
+                unit_class="volume",
             )
             _LOGGER.debug(
                 f"Adding {len(hour_statistics)} half-hourly consumption statistics"
@@ -700,7 +700,7 @@ class WatercareUsageSensor(SensorEntity):
                 statistic_id=f"{DOMAIN}:monthly_consumption",
                 unit_of_measurement=self._unit_of_measurement,
                 mean_type=StatisticMeanType.NONE,
-                unit_class=None,
+                unit_class="volume",
             )
             _LOGGER.debug(
                 f"Adding {len(month_statistics)} monthly consumption statistics"
@@ -884,7 +884,7 @@ class WatercareUsageSensor(SensorEntity):
                 statistic_id=f"{DOMAIN}:daily_consumption",
                 unit_of_measurement=self._unit_of_measurement,
                 mean_type=StatisticMeanType.NONE,
-                unit_class=None,
+                unit_class="volume",
             )
 
             _LOGGER.debug(f"Adding {len(day_statistics)} daily consumption statistics")
