@@ -1,5 +1,6 @@
 """Watercare API."""
 
+from datetime import datetime, timedelta
 import aiohttp
 import logging
 from typing import Any
@@ -216,6 +217,27 @@ class WatercareApi:
             "mechanicalmonthly",
         ]:
             raise ValueError("Invalid endpoint specified")
+
+        # These endpoints require from/to query params (otherwise the API
+        # returns 400). Default to a sensible window per endpoint when the
+        # caller doesn't specify one.
+        default_windows = {
+            "halfhourly": timedelta(days=7),
+            "dailywithstats": timedelta(days=365),
+            "monthly": timedelta(days=730),
+        }
+        if endpoint in default_windows:
+            if start_date is None:
+                end_date = datetime.now()
+                start_date = end_date - default_windows[endpoint]
+            elif end_date is None:
+                end_date = datetime.now()
+
+        if isinstance(start_date, datetime):
+            start_date = start_date.isoformat()
+
+        if isinstance(end_date, datetime):
+            end_date = end_date.isoformat()
 
         # If no account number, need to authenticate first
         if not self._accountNumber:
