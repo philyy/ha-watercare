@@ -30,8 +30,6 @@ from .const import (
     DEFAULT_WASTEWATER_RATIO,
     DEFAULT_ANNUAL_LINE_CHARGE,
     DEFAULT_ENDPOINT,
-    ENDPOINT_DISPLAY_NAMES,
-    STATISTIC_TYPES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -176,14 +174,6 @@ class WatercareUsageSensor(SensorEntity):
             "line_charge": DEFAULT_ANNUAL_LINE_CHARGE / 365,
         }
 
-    def _get_statistic_name(self, statistic_type: str) -> str:
-        """Generate consistent statistic names based on endpoint and type."""
-        endpoint_name = ENDPOINT_DISPLAY_NAMES.get(
-            self._endpoint, self._endpoint.title()
-        )
-        type_name = STATISTIC_TYPES.get(statistic_type, statistic_type.title())
-        return f"Watercare {endpoint_name} {type_name}"
-
     async def async_update(self):
         """Update the sensor data."""
         _LOGGER.debug(f"Beginning sensor update using endpoint: {self._endpoint}")
@@ -287,7 +277,7 @@ class WatercareUsageSensor(SensorEntity):
                 self.hass,
                 StatisticMetaData(
                     has_sum=True,
-                    name=self._get_statistic_name("consumption"),
+                    name="Watercare Water Consumption",
                     source=DOMAIN,
                     statistic_id=f"{DOMAIN}:water_consumption",
                     unit_of_measurement=self._unit_of_measurement,
