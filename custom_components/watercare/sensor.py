@@ -30,8 +30,6 @@ from .const import (
     DEFAULT_WASTEWATER_RATIO,
     DEFAULT_ANNUAL_LINE_CHARGE,
     DEFAULT_ENDPOINT,
-    ENDPOINT_DISPLAY_NAMES,
-    STATISTIC_TYPES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -176,14 +174,6 @@ class WatercareUsageSensor(SensorEntity):
             "line_charge": DEFAULT_ANNUAL_LINE_CHARGE / 365,
         }
 
-    def _get_statistic_name(self, statistic_type: str) -> str:
-        """Generate consistent statistic names based on endpoint and type."""
-        endpoint_name = ENDPOINT_DISPLAY_NAMES.get(
-            self._endpoint, self._endpoint.title()
-        )
-        type_name = STATISTIC_TYPES.get(statistic_type, statistic_type.title())
-        return f"Watercare {endpoint_name} {type_name}"
-
     async def async_update(self):
         """Update the sensor data."""
         _LOGGER.debug(f"Beginning sensor update using endpoint: {self._endpoint}")
@@ -265,6 +255,92 @@ class WatercareUsageSensor(SensorEntity):
         # Generate external statistics for Energy Dashboard
         await self.generate_statistics(billing_periods)
 
+    def _add_statistics(
+        self,
+        consumption_statistics,
+        cost_statistics,
+        consumption_cost_statistics,
+        wastewater_cost_statistics,
+    ):
+        """Write the shared external statistics for the configured endpoint.
+
+        All endpoints share one set of statistic ids (the integration tracks a
+        single meter and only one endpoint runs at a time), so switching
+        endpoints keeps the same Energy Dashboard source instead of orphaning a
+        previous one. Only the display name varies by endpoint.
+        """
+        if consumption_statistics:
+            _LOGGER.debug(
+                f"Adding {len(consumption_statistics)} consumption statistics"
+            )
+            async_add_external_statistics(
+                self.hass,
+                StatisticMetaData(
+                    has_sum=True,
+                    name="Watercare Water Consumption",
+                    source=DOMAIN,
+                    statistic_id=f"{DOMAIN}:water_consumption",
+                    unit_of_measurement=self._unit_of_measurement,
+                    mean_type=StatisticMeanType.NONE,
+                    unit_class="volume",
+                ),
+                consumption_statistics,
+            )
+        else:
+            _LOGGER.warning("No valid consumption statistics generated")
+
+        if cost_statistics:
+            _LOGGER.debug(f"Adding {len(cost_statistics)} cost statistics")
+            async_add_external_statistics(
+                self.hass,
+                StatisticMetaData(
+                    has_sum=True,
+                    name="Watercare Total Cost",
+                    source=DOMAIN,
+                    statistic_id=f"{DOMAIN}:water_cost",
+                    unit_of_measurement="NZD",
+                    mean_type=StatisticMeanType.NONE,
+                    unit_class=None,
+                ),
+                cost_statistics,
+            )
+
+        if consumption_cost_statistics and self._consumption_rate > 0:
+            _LOGGER.debug(
+                f"Adding {len(consumption_cost_statistics)} consumption cost statistics"
+            )
+            async_add_external_statistics(
+                self.hass,
+                StatisticMetaData(
+                    has_sum=True,
+                    name="Watercare Consumption Cost",
+                    source=DOMAIN,
+                    statistic_id=f"{DOMAIN}:consumption_cost",
+                    unit_of_measurement="NZD",
+                    mean_type=StatisticMeanType.NONE,
+                    unit_class=None,
+                ),
+                consumption_cost_statistics,
+            )
+
+        if wastewater_cost_statistics and self._wastewater_rate > 0:
+            _LOGGER.debug(
+                f"Adding {len(wastewater_cost_statistics)} wastewater cost statistics"
+            )
+            async_add_external_statistics(
+                self.hass,
+                StatisticMetaData(
+                    has_sum=True,
+                    name="Watercare Wastewater Cost",
+                    source=DOMAIN,
+                    statistic_id=f"{DOMAIN}:wastewater_cost",
+                    unit_of_measurement="NZD",
+                    mean_type=StatisticMeanType.NONE,
+                    unit_class=None,
+                ),
+                wastewater_cost_statistics,
+            )
+
     async def generate_statistics(self, billing_periods):
         """Generate external statistics from billing period data following Energy Dashboard pattern."""
         if not billing_periods:
@@ -339,77 +415,12 @@ class WatercareUsageSensor(SensorEntity):
                     _LOGGER.warning(f"Failed to parse date {end_date_str}: {e}")
                     continue
 
-        if period_statistics:
-            metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Water Consumption",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:water_consumption",
-                unit_of_measurement=self._unit_of_measurement,
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(
-                f"Adding {len(period_statistics)} water consumption statistics"
-            )
-            async_add_external_statistics(self.hass, metadata, period_statistics)
-        else:
-            _LOGGER.warning("No valid consumption statistics generated")
-
-        if cost_statistics:
-            cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Total Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:water_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(f"Adding {len(cost_statistics)} water cost statistics")
-            async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
-        else:
-            _LOGGER.warning("No valid cost statistics generated")
-
-        # Add consumption cost statistics if configured
-        if consumption_cost_statistics and self._consumption_rate > 0:
-            consumption_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Consumption Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:consumption_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(
-                f"Adding {len(consumption_cost_statistics)} consumption cost statistics"
-            )
-            async_add_external_statistics(
-                self.hass, consumption_cost_metadata, consumption_cost_statistics
-            )
-
-        # Add wastewater cost statistics if configured
-        if wastewater_cost_statistics and self._wastewater_rate > 0:
-            wastewater_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Wastewater Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:wastewater_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(
-                f"Adding {len(wastewater_cost_statistics)} wastewater cost statistics"
-            )
-            async_add_external_statistics(
-                self.hass, wastewater_cost_metadata, wastewater_cost_statistics
-            )
+        self._add_statistics(
+            period_statistics,
+            cost_statistics,
+            consumption_cost_statistics,
+            wastewater_cost_statistics,
+        )
 
     async def process_halfhourly_data(self, response):
         """Process the half-hourly usage data.
@@ -517,71 +528,12 @@ class WatercareUsageSensor(SensorEntity):
                     StatisticData(start=hour_start, sum=wastewater_cost_running_sum)
                 )
 
-        if hour_statistics:
-            consumption_metadata = StatisticMetaData(
-                has_sum=True,
-                name=self._get_statistic_name("consumption"),
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:halfhourly_consumption",
-                unit_of_measurement=self._unit_of_measurement,
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-            _LOGGER.debug(
-                f"Adding {len(hour_statistics)} half-hourly consumption statistics"
-            )
-            async_add_external_statistics(
-                self.hass, consumption_metadata, hour_statistics
-            )
-        else:
-            _LOGGER.warning("No valid half-hourly statistics generated")
-
-        if cost_statistics:
-            cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Half-hourly Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:halfhourly_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-            _LOGGER.debug(f"Adding {len(cost_statistics)} half-hourly cost statistics")
-            async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
-
-        if consumption_cost_statistics and self._consumption_rate > 0:
-            consumption_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Half-hourly Consumption Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:halfhourly_consumption_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-            _LOGGER.debug(
-                f"Adding {len(consumption_cost_statistics)} half-hourly consumption cost statistics"
-            )
-            async_add_external_statistics(
-                self.hass, consumption_cost_metadata, consumption_cost_statistics
-            )
-
-        if wastewater_cost_statistics and self._wastewater_rate > 0:
-            wastewater_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Half-hourly Wastewater Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:halfhourly_wastewater_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-            _LOGGER.debug(
-                f"Adding {len(wastewater_cost_statistics)} half-hourly wastewater cost statistics"
-            )
-            async_add_external_statistics(
-                self.hass, wastewater_cost_metadata, wastewater_cost_statistics
-            )
+        self._add_statistics(
+            hour_statistics,
+            cost_statistics,
+            consumption_cost_statistics,
+            wastewater_cost_statistics,
+        )
 
     async def process_monthly_data(self, response):
         """Process the monthly usage data.
@@ -692,71 +644,12 @@ class WatercareUsageSensor(SensorEntity):
                     StatisticData(start=month_start, sum=wastewater_cost_running_sum)
                 )
 
-        if month_statistics:
-            consumption_metadata = StatisticMetaData(
-                has_sum=True,
-                name=self._get_statistic_name("consumption"),
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:monthly_consumption",
-                unit_of_measurement=self._unit_of_measurement,
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-            _LOGGER.debug(
-                f"Adding {len(month_statistics)} monthly consumption statistics"
-            )
-            async_add_external_statistics(
-                self.hass, consumption_metadata, month_statistics
-            )
-        else:
-            _LOGGER.warning("No valid monthly statistics generated")
-
-        if cost_statistics:
-            cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Monthly Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:monthly_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-            _LOGGER.debug(f"Adding {len(cost_statistics)} monthly cost statistics")
-            async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
-
-        if consumption_cost_statistics and self._consumption_rate > 0:
-            consumption_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Monthly Consumption Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:monthly_consumption_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-            _LOGGER.debug(
-                f"Adding {len(consumption_cost_statistics)} monthly consumption cost statistics"
-            )
-            async_add_external_statistics(
-                self.hass, consumption_cost_metadata, consumption_cost_statistics
-            )
-
-        if wastewater_cost_statistics and self._wastewater_rate > 0:
-            wastewater_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Monthly Wastewater Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:monthly_wastewater_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-            _LOGGER.debug(
-                f"Adding {len(wastewater_cost_statistics)} monthly wastewater cost statistics"
-            )
-            async_add_external_statistics(
-                self.hass, wastewater_cost_metadata, wastewater_cost_statistics
-            )
+        self._add_statistics(
+            month_statistics,
+            cost_statistics,
+            consumption_cost_statistics,
+            wastewater_cost_statistics,
+        )
 
     @staticmethod
     def _month_length_days(parsed_months, index):
@@ -875,72 +768,9 @@ class WatercareUsageSensor(SensorEntity):
                     StatisticData(start=start, sum=wastewater_cost_running_sum)
                 )
 
-        # Add daily consumption statistics
-        if day_statistics:
-            day_metadata = StatisticMetaData(
-                has_sum=True,
-                name=self._get_statistic_name("consumption"),
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:daily_consumption",
-                unit_of_measurement=self._unit_of_measurement,
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(f"Adding {len(day_statistics)} daily consumption statistics")
-            async_add_external_statistics(self.hass, day_metadata, day_statistics)
-        else:
-            _LOGGER.warning("No daily statistics found, skipping update")
-
-        # Add daily cost statistics
-        if cost_statistics:
-            cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Daily Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:daily_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(f"Adding {len(cost_statistics)} daily cost statistics")
-            async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
-
-        # Add daily consumption cost statistics if configured
-        if consumption_cost_statistics and self._consumption_rate > 0:
-            consumption_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Daily Consumption Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:daily_consumption_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(
-                f"Adding {len(consumption_cost_statistics)} daily consumption cost statistics"
-            )
-            async_add_external_statistics(
-                self.hass, consumption_cost_metadata, consumption_cost_statistics
-            )
-
-        # Add daily wastewater cost statistics if configured
-        if wastewater_cost_statistics and self._wastewater_rate > 0:
-            wastewater_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Daily Wastewater Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:daily_wastewater_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
-            _LOGGER.debug(
-                f"Adding {len(wastewater_cost_statistics)} daily wastewater cost statistics"
-            )
-            async_add_external_statistics(
-                self.hass, wastewater_cost_metadata, wastewater_cost_statistics
-            )
+        self._add_statistics(
+            day_statistics,
+            cost_statistics,
+            consumption_cost_statistics,
+            wastewater_cost_statistics,
+        )
