@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta
 import aiohttp
 import logging
+import pytz
 from typing import Any
 from collections.abc import Mapping
 import json
@@ -13,6 +14,11 @@ import uuid
 from urllib.parse import parse_qs
 
 _LOGGER = logging.getLogger(__name__)
+
+# Watercare is an Auckland utility; usage days are NZ calendar days. The API
+# interprets request timestamps as UTC, so default windows are computed in this
+# zone and converted to UTC before being sent.
+_NZ_TIMEZONE = pytz.timezone("Pacific/Auckland")
 
 
 class WatercareApi:
@@ -218,6 +224,19 @@ class WatercareApi:
                 return response.status, await response.text()
             return response.status, None
 
+    @staticmethod
+    def _to_api_timestamp(value):
+        """Serialise a datetime for the API as a naive UTC ISO string.
+
+        The API interprets request timestamps as UTC, so timezone-aware values
+        are converted to UTC first. Non-datetime values pass through unchanged.
+        """
+        if isinstance(value, datetime):
+            if value.tzinfo is not None:
+                value = value.astimezone(pytz.utc).replace(tzinfo=None)
+            return value.isoformat()
+        return value
+
     async def get_data(
         self, endpoint: str, start_date: str = None, end_date: str = None
     ):
@@ -239,24 +258,19 @@ class WatercareApi:
             "monthly": timedelta(days=730),
         }
         if endpoint in default_windows:
+            now = datetime.now(_NZ_TIMEZONE)
             if start_date is None:
-                end_date = datetime.now()
-                # Start at midnight with an extra day of margin so the oldest
-                # day in the window is complete and has a preceding data point.
-                # The Energy Dashboard needs a prior point to attribute a day's
-                # first reading, and a window starting mid-day would otherwise
-                # leave the leading day partial and badly under-counted.
-                start_date = (
-                    end_date - default_windows[endpoint] - timedelta(days=1)
-                ).replace(hour=0, minute=0, second=0, microsecond=0)
+                end_date = now
+                # Align the window start to NZ midnight so the oldest day is a
+                # complete calendar day rather than starting partway through.
+                start_date = (now - default_windows[endpoint]).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
             elif end_date is None:
-                end_date = datetime.now()
+                end_date = now
 
-        if isinstance(start_date, datetime):
-            start_date = start_date.isoformat()
-
-        if isinstance(end_date, datetime):
-            end_date = end_date.isoformat()
+        start_date = self._to_api_timestamp(start_date)
+        end_date = self._to_api_timestamp(end_date)
 
         # If no account number, need to authenticate first
         if not self._accountNumber:
