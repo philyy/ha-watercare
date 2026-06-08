@@ -14,7 +14,11 @@ from homeassistant.components.recorder.models import (
     StatisticMetaData,
     StatisticMeanType,
 )
-from homeassistant.components.recorder.statistics import async_add_external_statistics
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    get_last_statistics,
+)
 
 from .const import (
     DOMAIN,
@@ -183,6 +187,77 @@ class WatercareUsageSensor(SensorEntity):
         )
         type_name = STATISTIC_TYPES.get(statistic_type, statistic_type.title())
         return f"Watercare {endpoint_name} {type_name}"
+
+    async def _get_last_cumulative(self, statistic_id):
+        """Return (last_start_timestamp, last_sum) for a statistic id.
+
+        Returns (None, 0.0) if nothing is stored yet. Used to continue the
+        cumulative sum from what's already in the recorder rather than
+        recomputing from zero each poll (which, with a trailing fetch window,
+        makes the running total drop at the window edge and produces negative
+        days on the Energy Dashboard).
+        """
+        last = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
+        )
+        rows = last.get(statistic_id)
+        if not rows:
+            return None, 0.0
+        return rows[0]["start"], rows[0].get("sum") or 0.0
+
+    async def _build_cumulative_statistics(
+        self,
+        points,
+        consumption_id,
+        cost_id,
+        consumption_cost_id,
+        wastewater_cost_id,
+    ):
+        """Build anchored cumulative StatisticData lists from chronological points.
+
+        ``points`` is an iterable of ``(start_datetime, litres, number_of_days)``
+        ordered oldest-first. Each series continues from the value already
+        stored for its statistic id, and points at or before the last stored
+        timestamp are skipped (already recorded), so the running sums only ever
+        grow and never reset.
+        """
+        last_start, consumption_sum = await self._get_last_cumulative(consumption_id)
+        _, cost_sum = await self._get_last_cumulative(cost_id)
+        _, consumption_cost_sum = await self._get_last_cumulative(consumption_cost_id)
+        _, wastewater_cost_sum = await self._get_last_cumulative(wastewater_cost_id)
+
+        consumption_stats = []
+        cost_stats = []
+        consumption_cost_stats = []
+        wastewater_cost_stats = []
+
+        for start, litres, number_of_days in points:
+            if last_start is not None and start.timestamp() <= last_start:
+                continue  # already stored in a previous poll
+
+            consumption_sum += litres
+            breakdown = self._calculate_cost(litres, number_of_days)
+            cost_sum += breakdown["total"]
+            consumption_cost_sum += breakdown["consumption"]
+            wastewater_cost_sum += breakdown["wastewater"]
+
+            consumption_stats.append(StatisticData(start=start, sum=consumption_sum))
+            cost_stats.append(StatisticData(start=start, sum=cost_sum))
+            if self._consumption_rate > 0:
+                consumption_cost_stats.append(
+                    StatisticData(start=start, sum=consumption_cost_sum)
+                )
+            if self._wastewater_rate > 0:
+                wastewater_cost_stats.append(
+                    StatisticData(start=start, sum=wastewater_cost_sum)
+                )
+
+        return (
+            consumption_stats,
+            cost_stats,
+            consumption_cost_stats,
+            wastewater_cost_stats,
+        )
 
     async def async_update(self):
         """Update the sensor data."""
@@ -356,74 +431,41 @@ class WatercareUsageSensor(SensorEntity):
         if not billing_periods:
             return
 
-        period_statistics = []
-        cost_statistics = []
-        consumption_cost_statistics = []
-        wastewater_cost_statistics = []
-        running_sum = 0
-        cost_running_sum = 0
-        consumption_cost_running_sum = 0
-        wastewater_cost_running_sum = 0
-
-        # Sort periods by date (oldest first) for cumulative calculation
+        # Build chronological (start, litres, number_of_days) points.
+        points = []
         sorted_periods = sorted(
             billing_periods, key=lambda x: x.get("billingPeriodToDate", "")
         )
-
         for period in sorted_periods:
             end_date_str = period.get("billingPeriodToDate")
-            if end_date_str:
-                try:
-                    # Parse and convert to NZ timezone
-                    end_date = datetime.strptime(end_date_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-                    end_date = pytz.utc.localize(end_date).astimezone(NZ_TIMEZONE)
-
-                    period_usage = period.get("waterUsage", 0)
-                    running_sum += period_usage
-
-                    numberOfDays = (
-                        datetime.strptime(
-                            period.get("billingPeriodToDate"), "%Y-%m-%dT%H:%M:%S.%fZ"
-                        )
-                        - datetime.strptime(
-                            period.get("billingPeriodFromDate"), "%Y-%m-%dT%H:%M:%S.%fZ"
-                        )
-                    ).days + 1
-
-                    cost_breakdown = self._calculate_cost(period_usage, numberOfDays)
-                    cost_running_sum += cost_breakdown["total"]
-                    consumption_cost_running_sum += cost_breakdown["consumption"]
-                    wastewater_cost_running_sum += cost_breakdown["wastewater"]
-
-                    # Create StatisticData with running sum (critical for Energy Dashboard)
-                    period_statistics.append(
-                        StatisticData(start=end_date, sum=running_sum)
+            if not end_date_str:
+                continue
+            try:
+                end_date = datetime.strptime(end_date_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+                end_date = pytz.utc.localize(end_date).astimezone(NZ_TIMEZONE)
+                number_of_days = (
+                    datetime.strptime(end_date_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+                    - datetime.strptime(
+                        period.get("billingPeriodFromDate"), "%Y-%m-%dT%H:%M:%S.%fZ"
                     )
+                ).days + 1
+            except (ValueError, TypeError) as e:
+                _LOGGER.warning(f"Failed to parse date {end_date_str}: {e}")
+                continue
+            points.append((end_date, period.get("waterUsage", 0), number_of_days))
 
-                    # Create cost statistics
-                    cost_statistics.append(
-                        StatisticData(start=end_date, sum=cost_running_sum)
-                    )
-
-                    # Create consumption cost statistics if rate is configured
-                    if self._consumption_rate > 0:
-                        consumption_cost_statistics.append(
-                            StatisticData(
-                                start=end_date, sum=consumption_cost_running_sum
-                            )
-                        )
-
-                    # Create wastewater cost statistics if rate is configured
-                    if self._wastewater_rate > 0:
-                        wastewater_cost_statistics.append(
-                            StatisticData(
-                                start=end_date, sum=wastewater_cost_running_sum
-                            )
-                        )
-
-                except (ValueError, TypeError) as e:
-                    _LOGGER.warning(f"Failed to parse date {end_date_str}: {e}")
-                    continue
+        (
+            period_statistics,
+            cost_statistics,
+            consumption_cost_statistics,
+            wastewater_cost_statistics,
+        ) = await self._build_cumulative_statistics(
+            points,
+            f"{DOMAIN}:water_consumption",
+            f"{DOMAIN}:water_cost",
+            f"{DOMAIN}:consumption_cost",
+            f"{DOMAIN}:wastewater_cost",
+        )
 
         self._add_water_statistics(
             period_statistics,
@@ -502,41 +544,23 @@ class WatercareUsageSensor(SensorEntity):
         }
 
         # Generate hourly statistics for the Energy Dashboard.
-        hour_statistics = []
-        cost_statistics = []
-        consumption_cost_statistics = []
-        wastewater_cost_statistics = []
-        litres_running_sum = 0
-        cost_running_sum = 0
-        consumption_cost_running_sum = 0
-        wastewater_cost_running_sum = 0
-
         # One hour is 1/24 of a day for the line-charge portion of cost.
-        hour_fraction = 1 / 24
-
-        for hour_start in sorted(hourly_consumption):
-            litres = hourly_consumption[hour_start]
-            litres_running_sum += litres
-
-            hour_cost_breakdown = self._calculate_cost(litres, hour_fraction)
-            cost_running_sum += hour_cost_breakdown["total"]
-            consumption_cost_running_sum += hour_cost_breakdown["consumption"]
-            wastewater_cost_running_sum += hour_cost_breakdown["wastewater"]
-
-            hour_statistics.append(
-                StatisticData(start=hour_start, sum=litres_running_sum)
-            )
-            cost_statistics.append(
-                StatisticData(start=hour_start, sum=cost_running_sum)
-            )
-            if self._consumption_rate > 0:
-                consumption_cost_statistics.append(
-                    StatisticData(start=hour_start, sum=consumption_cost_running_sum)
-                )
-            if self._wastewater_rate > 0:
-                wastewater_cost_statistics.append(
-                    StatisticData(start=hour_start, sum=wastewater_cost_running_sum)
-                )
+        points = [
+            (hour_start, hourly_consumption[hour_start], 1 / 24)
+            for hour_start in sorted(hourly_consumption)
+        ]
+        (
+            hour_statistics,
+            cost_statistics,
+            consumption_cost_statistics,
+            wastewater_cost_statistics,
+        ) = await self._build_cumulative_statistics(
+            points,
+            f"{DOMAIN}:water_consumption",
+            f"{DOMAIN}:water_cost",
+            f"{DOMAIN}:consumption_cost",
+            f"{DOMAIN}:wastewater_cost",
+        )
 
         self._add_water_statistics(
             hour_statistics,
@@ -620,39 +644,26 @@ class WatercareUsageSensor(SensorEntity):
         }
 
         # Generate monthly statistics for the Energy Dashboard.
-        month_statistics = []
-        cost_statistics = []
-        consumption_cost_statistics = []
-        wastewater_cost_statistics = []
-        litres_running_sum = 0
-        cost_running_sum = 0
-        consumption_cost_running_sum = 0
-        wastewater_cost_running_sum = 0
-
-        for index, (month_start, entry) in enumerate(parsed_months):
-            litres = entry.get("litres", 0)
-            litres_running_sum += litres
-
-            number_of_days = self._month_length_days(parsed_months, index)
-            month_cost_breakdown = self._calculate_cost(litres, number_of_days)
-            cost_running_sum += month_cost_breakdown["total"]
-            consumption_cost_running_sum += month_cost_breakdown["consumption"]
-            wastewater_cost_running_sum += month_cost_breakdown["wastewater"]
-
-            month_statistics.append(
-                StatisticData(start=month_start, sum=litres_running_sum)
+        points = [
+            (
+                month_start,
+                entry.get("litres", 0),
+                self._month_length_days(parsed_months, index),
             )
-            cost_statistics.append(
-                StatisticData(start=month_start, sum=cost_running_sum)
-            )
-            if self._consumption_rate > 0:
-                consumption_cost_statistics.append(
-                    StatisticData(start=month_start, sum=consumption_cost_running_sum)
-                )
-            if self._wastewater_rate > 0:
-                wastewater_cost_statistics.append(
-                    StatisticData(start=month_start, sum=wastewater_cost_running_sum)
-                )
+            for index, (month_start, entry) in enumerate(parsed_months)
+        ]
+        (
+            month_statistics,
+            cost_statistics,
+            consumption_cost_statistics,
+            wastewater_cost_statistics,
+        ) = await self._build_cumulative_statistics(
+            points,
+            f"{DOMAIN}:water_consumption",
+            f"{DOMAIN}:water_cost",
+            f"{DOMAIN}:consumption_cost",
+            f"{DOMAIN}:wastewater_cost",
+        )
 
         self._add_water_statistics(
             month_statistics,
@@ -686,7 +697,6 @@ class WatercareUsageSensor(SensorEntity):
         usage_data = parsed_data.get("usage", [])
         statistic_data = parsed_data.get("statistics", {})
 
-        litresRunningSum = 0
         daily_consumption = {}
 
         for entry in usage_data:
@@ -733,50 +743,26 @@ class WatercareUsageSensor(SensorEntity):
         }
 
         # Generate statistics for daily data
-        day_statistics = []
-        cost_statistics = []
-        consumption_cost_statistics = []
-        wastewater_cost_statistics = []
-        running_cost_sum = 0
-        consumption_cost_running_sum = 0
-        wastewater_cost_running_sum = 0
-        first = True
-
-        for date, litres in daily_consumption.items():
-            start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=NZ_TIMEZONE)
-
-            # HASSIO statistics requires us to add values as a sum of all previous values.
-            litresRunningSum += litres
-
-            # Calculate cost for this day
-            daily_cost_breakdown = self._calculate_cost(litres, 1)
-            running_cost_sum += daily_cost_breakdown["total"]
-            consumption_cost_running_sum += daily_cost_breakdown["consumption"]
-            wastewater_cost_running_sum += daily_cost_breakdown["wastewater"]
-
-            if first:
-                reset = start
-                first = False
-
-            # Add consumption statistics
-            day_statistics.append(
-                StatisticData(start=start, sum=litresRunningSum, last_reset=reset)
+        points = [
+            (
+                datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=NZ_TIMEZONE),
+                litres,
+                1,
             )
-
-            # Add cost statistics
-            cost_statistics.append(StatisticData(start=start, sum=running_cost_sum))
-
-            # Add consumption cost statistics if rate is configured
-            if self._consumption_rate > 0:
-                consumption_cost_statistics.append(
-                    StatisticData(start=start, sum=consumption_cost_running_sum)
-                )
-
-            # Add wastewater cost statistics if rate is configured
-            if self._wastewater_rate > 0:
-                wastewater_cost_statistics.append(
-                    StatisticData(start=start, sum=wastewater_cost_running_sum)
-                )
+            for date, litres in sorted(daily_consumption.items())
+        ]
+        (
+            day_statistics,
+            cost_statistics,
+            consumption_cost_statistics,
+            wastewater_cost_statistics,
+        ) = await self._build_cumulative_statistics(
+            points,
+            f"{DOMAIN}:daily_consumption",
+            f"{DOMAIN}:daily_cost",
+            f"{DOMAIN}:daily_consumption_cost",
+            f"{DOMAIN}:daily_wastewater_cost",
+        )
 
         # Add daily consumption statistics
         if day_statistics:
