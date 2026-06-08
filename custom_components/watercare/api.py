@@ -241,7 +241,14 @@ class WatercareApi:
         if endpoint in default_windows:
             if start_date is None:
                 end_date = datetime.now()
-                start_date = end_date - default_windows[endpoint]
+                # Start at midnight with an extra day of margin so the oldest
+                # day in the window is complete and has a preceding data point.
+                # The Energy Dashboard needs a prior point to attribute a day's
+                # first reading, and a window starting mid-day would otherwise
+                # leave the leading day partial and badly under-counted.
+                start_date = (
+                    end_date - default_windows[endpoint] - timedelta(days=1)
+                ).replace(hour=0, minute=0, second=0, microsecond=0)
             elif end_date is None:
                 end_date = datetime.now()
 
