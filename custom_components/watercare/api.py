@@ -206,6 +206,18 @@ class WatercareApi:
                     "Failed to fetch customer accounts %s", await result.text()
                 )
 
+    async def _request_usage(self, url):
+        """Perform the usage GET request, returning (status, body_text|None)."""
+        headers = {"authorization": "Bearer " + (self._token or "")}
+        jar = aiohttp.CookieJar(quote_cookie=False)
+        async with (
+            aiohttp.ClientSession(cookie_jar=jar) as session,
+            session.get(url, headers=headers) as response,
+        ):
+            if response.status == 200:
+                return response.status, await response.text()
+            return response.status, None
+
     async def get_data(
         self, endpoint: str, start_date: str = None, end_date: str = None
     ):
@@ -247,24 +259,30 @@ class WatercareApi:
                 _LOGGER.error("Authentication failed - no account number obtained")
                 return None
 
-        headers = {"authorization": "Bearer " + (self._token or "")}
-
         url = f"{self._url_base}v1/usage/{self._accountNumber}/{endpoint}"
         if start_date and end_date:
             url += f"?from={start_date}&to={end_date}"
 
         _LOGGER.debug(f"Calling API URL: {url}")
 
-        jar = aiohttp.CookieJar(quote_cookie=False)
-        async with (
-            aiohttp.ClientSession(cookie_jar=jar) as session,
-            session.get(url, headers=headers) as response,
-        ):
-            if response.status == 200:
-                data = await response.text()
-                _LOGGER.debug(f"API Response status: {response.status}")
-                _LOGGER.debug(f"API Response data length: {len(data) if data else 0}")
-                return data
-            else:
-                _LOGGER.error(f"Could not fetch consumption: {response.status}")
-                return None
+        status, data = await self._request_usage(url)
+
+        # A 401 means the access token has expired (they are short-lived, but
+        # we poll infrequently). Refresh it with the refresh token and retry;
+        # if that still fails, fall back to a full re-authentication.
+        if status == 401:
+            _LOGGER.debug("Access token rejected (401); refreshing access token")
+            await self.get_api_token()
+            status, data = await self._request_usage(url)
+            if status == 401:
+                _LOGGER.debug("Still 401 after refresh; re-authenticating")
+                await self.get_refresh_token()
+                status, data = await self._request_usage(url)
+
+        if status == 200:
+            _LOGGER.debug(f"API Response status: {status}")
+            _LOGGER.debug(f"API Response data length: {len(data) if data else 0}")
+            return data
+
+        _LOGGER.error(f"Could not fetch consumption: {status}")
+        return None
