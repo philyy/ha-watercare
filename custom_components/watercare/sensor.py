@@ -76,20 +76,18 @@ async def async_setup_entry(
         )
         endpoint = entry.options.get(CONF_ENDPOINT, endpoint)
 
-    async_add_entities(
-        [
-            WatercareUsageSensor(
-                SENSOR_NAME,
-                api,
-                consumption_rate,
-                wastewater_rate,
-                wastewater_ratio,
-                annual_line_charge,
-                endpoint,
-            )
-        ],
-        True,
+    sensor = WatercareUsageSensor(
+        SENSOR_NAME,
+        api,
+        consumption_rate,
+        wastewater_rate,
+        wastewater_ratio,
+        annual_line_charge,
+        endpoint,
     )
+    # Expose the sensor so the import-history button/service can drive it.
+    hass.data[DOMAIN]["sensor"] = sensor
+    async_add_entities([sensor], True)
 
 
 class WatercareUsageSensor(SensorEntity):
@@ -212,19 +210,31 @@ class WatercareUsageSensor(SensorEntity):
         cost_id,
         consumption_cost_id,
         wastewater_cost_id,
+        anchor=True,
     ):
-        """Build anchored cumulative StatisticData lists from chronological points.
+        """Build cumulative StatisticData lists from chronological points.
 
         ``points`` is an iterable of ``(start_datetime, litres, number_of_days)``
-        ordered oldest-first. Each series continues from the value already
-        stored for its statistic id, and points at or before the last stored
-        timestamp are skipped (already recorded), so the running sums only ever
-        grow and never reset.
+        ordered oldest-first. When ``anchor`` is True (normal polling) each
+        series continues from the value already stored for its statistic id and
+        points at or before the last stored timestamp are skipped, so the running
+        sums only ever grow and never reset. When False (a full history import)
+        the sums are recomputed from zero over all points, overwriting the series.
         """
-        last_start, consumption_sum = await self._get_last_cumulative(consumption_id)
-        _, cost_sum = await self._get_last_cumulative(cost_id)
-        _, consumption_cost_sum = await self._get_last_cumulative(consumption_cost_id)
-        _, wastewater_cost_sum = await self._get_last_cumulative(wastewater_cost_id)
+        if anchor:
+            last_start, consumption_sum = await self._get_last_cumulative(
+                consumption_id
+            )
+            _, cost_sum = await self._get_last_cumulative(cost_id)
+            _, consumption_cost_sum = await self._get_last_cumulative(
+                consumption_cost_id
+            )
+            _, wastewater_cost_sum = await self._get_last_cumulative(
+                wastewater_cost_id
+            )
+        else:
+            last_start = None
+            consumption_sum = cost_sum = consumption_cost_sum = wastewater_cost_sum = 0.0
 
         consumption_stats = []
         cost_stats = []
@@ -257,6 +267,138 @@ class WatercareUsageSensor(SensorEntity):
             cost_stats,
             consumption_cost_stats,
             wastewater_cost_stats,
+        )
+
+    def _statistic_ids(self):
+        """Return (consumption, cost, consumption_cost, wastewater_cost) ids."""
+        if self._endpoint == "dailywithstats":
+            return (
+                f"{DOMAIN}:daily_consumption",
+                f"{DOMAIN}:daily_cost",
+                f"{DOMAIN}:daily_consumption_cost",
+                f"{DOMAIN}:daily_wastewater_cost",
+            )
+        return (
+            f"{DOMAIN}:water_consumption",
+            f"{DOMAIN}:water_cost",
+            f"{DOMAIN}:consumption_cost",
+            f"{DOMAIN}:wastewater_cost",
+        )
+
+    @staticmethod
+    def _parse_period_start(timestamp_str, mode):
+        """Parse an API timestamp into an NZ-localised period start."""
+        if not timestamp_str:
+            return None
+        try:
+            ts = datetime.strptime(timestamp_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+        except (ValueError, TypeError):
+            return None
+        ts = pytz.utc.localize(ts).astimezone(NZ_TIMEZONE)
+        if mode == "day":
+            return datetime.strptime(ts.strftime("%Y-%m-%d"), "%Y-%m-%d").replace(
+                tzinfo=NZ_TIMEZONE
+            )
+        return ts.replace(minute=0, second=0, microsecond=0)
+
+    def _accumulate_history(self, response, buckets):
+        """Aggregate one chunk of API data into {period_start: litres}."""
+        try:
+            data = json.loads(response)
+        except (TypeError, json.JSONDecodeError):
+            return
+        if self._endpoint == "halfhourly":
+            for entry in data:
+                start = self._parse_period_start(entry.get("timestamp"), "hour")
+                if start is not None:
+                    buckets[start] = buckets.get(start, 0) + entry.get("litres", 0)
+        elif self._endpoint == "monthly":
+            for entry in data:
+                start = self._parse_period_start(entry.get("timestamp"), "hour")
+                if start is not None:
+                    buckets[start] = entry.get("litres", 0)
+        elif self._endpoint == "dailywithstats":
+            for entry in data.get("usage", []):
+                start = self._parse_period_start(entry.get("timestamp"), "day")
+                if start is not None:
+                    buckets[start] = buckets.get(start, 0) + entry.get("litres", 0)
+
+    async def async_import_history(self, start=None):
+        """Backfill historical statistics from `start` (or install date) to now.
+
+        Fetches the full history in API-sized chunks, rebuilds one continuous
+        cumulative series from zero and imports it (overwriting), establishing a
+        clean baseline that subsequent anchored polls extend. Safe to re-run.
+        """
+        if self._endpoint == "mechanicalmonthly":
+            _LOGGER.info(
+                "History import not applicable for mechanicalmonthly "
+                "(a normal update already returns all billing periods)"
+            )
+            return
+
+        if not await self._api.async_ensure_authenticated():
+            _LOGGER.error("Watercare history import: authentication failed")
+            return
+
+        end = datetime.now(NZ_TIMEZONE)
+        if start is None:
+            start = self._api.install_date or (end - timedelta(days=730))
+        if start.tzinfo is None:
+            start = pytz.utc.localize(start)
+        start = start.astimezone(NZ_TIMEZONE)
+
+        # Only halfhourly is dense enough to hit the API's row cap; daily and
+        # monthly fit any realistic range in a single call.
+        chunk = (
+            timedelta(days=150)
+            if self._endpoint == "halfhourly"
+            else timedelta(days=3650)
+        )
+        _LOGGER.info(
+            "Watercare history import (%s) from %s to %s",
+            self._endpoint,
+            start.date(),
+            end.date(),
+        )
+
+        buckets = {}
+        cursor = start
+        while cursor < end:
+            chunk_end = min(cursor + chunk, end)
+            response = await self._api.get_data(self._endpoint, cursor, chunk_end)
+            if response:
+                self._accumulate_history(response, buckets)
+            cursor = chunk_end
+
+        if not buckets:
+            _LOGGER.warning("Watercare history import: no data returned")
+            return
+
+        ordered = sorted(buckets)
+        if self._endpoint == "monthly":
+            points = [
+                (
+                    ordered[i],
+                    buckets[ordered[i]],
+                    max((ordered[i] - ordered[i - 1]).days, 1) if i > 0 else 30,
+                )
+                for i in range(len(ordered))
+            ]
+        elif self._endpoint == "halfhourly":
+            points = [(k, buckets[k], 1 / 24) for k in ordered]
+        else:  # dailywithstats
+            points = [(k, buckets[k], 1) for k in ordered]
+
+        stats = await self._build_cumulative_statistics(
+            points, *self._statistic_ids(), anchor=False
+        )
+        if self._endpoint == "dailywithstats":
+            self._add_daily_statistics(*stats)
+        else:
+            self._add_water_statistics(*stats)
+        _LOGGER.info(
+            "Watercare history import complete: %d points imported", len(points)
         )
 
     async def async_update(self):
@@ -764,72 +906,89 @@ class WatercareUsageSensor(SensorEntity):
             f"{DOMAIN}:daily_wastewater_cost",
         )
 
-        # Add daily consumption statistics
-        if day_statistics:
-            day_metadata = StatisticMetaData(
-                has_sum=True,
-                name=self._get_statistic_name("consumption"),
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:daily_consumption",
-                unit_of_measurement=self._unit_of_measurement,
-                mean_type=StatisticMeanType.NONE,
-                unit_class="volume",
-            )
+        self._add_daily_statistics(
+            day_statistics,
+            cost_statistics,
+            consumption_cost_statistics,
+            wastewater_cost_statistics,
+        )
 
-            _LOGGER.debug(f"Adding {len(day_statistics)} daily consumption statistics")
-            async_add_external_statistics(self.hass, day_metadata, day_statistics)
+    def _add_daily_statistics(
+        self,
+        consumption_statistics,
+        cost_statistics,
+        consumption_cost_statistics,
+        wastewater_cost_statistics,
+    ):
+        """Write the watercare:daily_* external statistics (dailywithstats)."""
+        if consumption_statistics:
+            _LOGGER.debug(
+                f"Adding {len(consumption_statistics)} daily consumption statistics"
+            )
+            async_add_external_statistics(
+                self.hass,
+                StatisticMetaData(
+                    has_sum=True,
+                    name=self._get_statistic_name("consumption"),
+                    source=DOMAIN,
+                    statistic_id=f"{DOMAIN}:daily_consumption",
+                    unit_of_measurement=self._unit_of_measurement,
+                    mean_type=StatisticMeanType.NONE,
+                    unit_class="volume",
+                ),
+                consumption_statistics,
+            )
         else:
             _LOGGER.warning("No daily statistics found, skipping update")
 
-        # Add daily cost statistics
         if cost_statistics:
-            cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Daily Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:daily_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
             _LOGGER.debug(f"Adding {len(cost_statistics)} daily cost statistics")
-            async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
-
-        # Add daily consumption cost statistics if configured
-        if consumption_cost_statistics and self._consumption_rate > 0:
-            consumption_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Daily Consumption Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:daily_consumption_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
+            async_add_external_statistics(
+                self.hass,
+                StatisticMetaData(
+                    has_sum=True,
+                    name="Watercare Daily Cost",
+                    source=DOMAIN,
+                    statistic_id=f"{DOMAIN}:daily_cost",
+                    unit_of_measurement="NZD",
+                    mean_type=StatisticMeanType.NONE,
+                    unit_class=None,
+                ),
+                cost_statistics,
             )
 
+        if consumption_cost_statistics and self._consumption_rate > 0:
             _LOGGER.debug(
                 f"Adding {len(consumption_cost_statistics)} daily consumption cost statistics"
             )
             async_add_external_statistics(
-                self.hass, consumption_cost_metadata, consumption_cost_statistics
+                self.hass,
+                StatisticMetaData(
+                    has_sum=True,
+                    name="Watercare Daily Consumption Cost",
+                    source=DOMAIN,
+                    statistic_id=f"{DOMAIN}:daily_consumption_cost",
+                    unit_of_measurement="NZD",
+                    mean_type=StatisticMeanType.NONE,
+                    unit_class=None,
+                ),
+                consumption_cost_statistics,
             )
 
-        # Add daily wastewater cost statistics if configured
         if wastewater_cost_statistics and self._wastewater_rate > 0:
-            wastewater_cost_metadata = StatisticMetaData(
-                has_sum=True,
-                name="Watercare Daily Wastewater Cost",
-                source=DOMAIN,
-                statistic_id=f"{DOMAIN}:daily_wastewater_cost",
-                unit_of_measurement="NZD",
-                mean_type=StatisticMeanType.NONE,
-                unit_class=None,
-            )
-
             _LOGGER.debug(
                 f"Adding {len(wastewater_cost_statistics)} daily wastewater cost statistics"
             )
             async_add_external_statistics(
-                self.hass, wastewater_cost_metadata, wastewater_cost_statistics
+                self.hass,
+                StatisticMetaData(
+                    has_sum=True,
+                    name="Watercare Daily Wastewater Cost",
+                    source=DOMAIN,
+                    statistic_id=f"{DOMAIN}:daily_wastewater_cost",
+                    unit_of_measurement="NZD",
+                    mean_type=StatisticMeanType.NONE,
+                    unit_class=None,
+                ),
+                wastewater_cost_statistics,
             )
