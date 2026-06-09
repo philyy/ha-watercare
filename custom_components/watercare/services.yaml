@@ -1,0 +1,15 @@
+import_history:
+  name: Import history
+  description: >-
+    Backfill historical water statistics from the meter install date (or a given
+    start date) up to now. Safe to re-run; it rebuilds the statistics series.
+  fields:
+    start_date:
+      name: Start date
+      description: >-
+        Optional ISO date/datetime to import from (e.g. 2024-01-01). Defaults to
+        the meter install date.
+      example: "2024-01-01"
+      required: false
+      selector:
+        text:

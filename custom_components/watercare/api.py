@@ -38,10 +38,27 @@ class WatercareApi:
         self._password = password
 
         self._accountNumber = None
+        self._install_date = None
         self._token = None
         self._refresh_token = None
         self._refresh_token_expires_in = 0
         self._access_token_expires_in = 0
+
+    @property
+    def install_date(self):
+        """Return the meter install date as an aware datetime, or None."""
+        if not self._install_date:
+            return None
+        try:
+            return datetime.fromisoformat(self._install_date)
+        except (ValueError, TypeError):
+            return None
+
+    async def async_ensure_authenticated(self):
+        """Authenticate if needed; return True once an account is available."""
+        if not self._accountNumber:
+            await self.get_refresh_token()
+        return self._accountNumber is not None
 
     def get_setting_json(self, page: str) -> Mapping[str, Any] | None:
         """Get the settings from json result."""
@@ -201,6 +218,7 @@ class WatercareApi:
                 _LOGGER.debug(f"Accounts: {data}")
                 if data and isinstance(data, list) and len(data) > 0:
                     self._accountNumber = data[0].get("accountNumber")
+                    self._install_date = data[0].get("installDate")
                     if self._accountNumber:
                         _LOGGER.debug(f"AccountNumber: {self._accountNumber}")
                     else:
